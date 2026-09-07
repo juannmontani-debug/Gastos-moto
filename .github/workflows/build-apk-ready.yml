@@ -1,0 +1,524 @@
+name: Construir APK Gastos de Viaje
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Configurar Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Configurar Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Crear proyecto Android nativo
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf native
+          mkdir -p native/app/src/main/java/com/gastosviaje/app
+          mkdir -p native/app/src/main/res/values
+          mkdir -p native/app/src/main/res/xml
+          mkdir -p native/app/src/main/assets/www
+
+          cat > native/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "GastosViaje"
+          include(":app")
+          EOF
+
+          cat > native/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > native/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.gastosviaje.app"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.gastosviaje.app"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 101
+                  versionName = "1.0-native-alpha2"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.activity:activity-ktx:1.10.0")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("androidx.webkit:webkit:1.12.1")
+          }
+          EOF
+
+          cat > native/app/src/main/res/values/strings.xml <<'EOF'
+          <resources><string name="app_name">Gastos de Viaje</string></resources>
+          EOF
+
+          cat > native/app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowActionModeOverlay">true</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > native/app/src/main/res/xml/network_security_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <network-security-config>
+              <base-config cleartextTrafficPermitted="false" />
+          </network-security-config>
+          EOF
+
+          cat > native/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Gastos de Viaje"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="false"
+                  android:networkSecurityConfig="@xml/network_security_config">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="unspecified">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".LocationTrackingService"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > native/app/src/main/java/com/gastosviaje/app/LocationTrackingService.kt <<'EOF'
+          package com.gastosviaje.app
+
+          import android.Manifest
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.IBinder
+          import androidx.core.app.ActivityCompat
+          import androidx.core.app.NotificationCompat
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.time.LocalDate
+
+          class LocationTrackingService : Service(), LocationListener {
+              companion object {
+                  const val ACTION_START = "com.gastosviaje.app.START_ROUTE"
+                  const val ACTION_STOP = "com.gastosviaje.app.STOP_ROUTE"
+                  const val ACTION_POINT = "com.gastosviaje.app.ROUTE_POINT"
+                  const val EXTRA_DAY = "day"
+                  const val EXTRA_LAT = "lat"
+                  const val EXTRA_LON = "lon"
+                  const val EXTRA_ACC = "acc"
+                  const val EXTRA_TS = "ts"
+                  private const val CHANNEL_ID = "route_tracking"
+                  private const val NOTIF_ID = 1206
+                  private const val PREFS = "native_routes"
+              }
+
+              private lateinit var locationManager: LocationManager
+              private var day: String = ""
+              private var lastAccepted: Location? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                  createChannel()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> {
+                          stopTracking()
+                          stopSelf()
+                          return START_NOT_STICKY
+                      }
+                      else -> {
+                          day = intent?.getStringExtra(EXTRA_DAY).orEmpty().ifBlank { LocalDate.now().toString() }
+                          startForeground(NOTIF_ID, buildNotification())
+                          startTracking()
+                          return START_STICKY
+                      }
+                  }
+              }
+
+              private fun createChannel() {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val nm = getSystemService(NotificationManager::class.java)
+                      nm.createNotificationChannel(
+                          NotificationChannel(CHANNEL_ID, "Recorrido GPS", NotificationManager.IMPORTANCE_LOW).apply {
+                              description = "Mantiene el GPS activo mientras grabás el recorrido"
+                          }
+                      )
+                  }
+              }
+
+              private fun buildNotification(): android.app.Notification {
+                  val open = Intent(this, MainActivity::class.java)
+                  val pi = PendingIntent.getActivity(
+                      this, 0, open,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  return NotificationCompat.Builder(this, CHANNEL_ID)
+                      .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                      .setContentTitle("Gastos de Viaje")
+                      .setContentText("Grabando recorrido GPS en segundo plano")
+                      .setOngoing(true)
+                      .setContentIntent(pi)
+                      .build()
+              }
+
+              private fun startTracking() {
+                  if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+                      ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      stopSelf(); return
+                  }
+                  try { locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 3000L, 4f, this) } catch (_: Exception) {}
+                  try { locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 6000L, 8f, this) } catch (_: Exception) {}
+              }
+
+              override fun onLocationChanged(location: Location) {
+                  if (location.accuracy > 80f) return
+                  val last = lastAccepted
+                  if (last != null && last.distanceTo(location) < 5f) return
+                  lastAccepted = location
+                  appendPoint(location)
+                  sendBroadcast(Intent(ACTION_POINT).setPackage(packageName).apply {
+                      putExtra(EXTRA_LAT, location.latitude)
+                      putExtra(EXTRA_LON, location.longitude)
+                      putExtra(EXTRA_ACC, location.accuracy.toDouble())
+                      putExtra(EXTRA_TS, location.time)
+                  })
+              }
+
+              private fun appendPoint(location: Location) {
+                  val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                  val key = "route_$day"
+                  val arr = try { JSONArray(prefs.getString(key, "[]")) } catch (_: Exception) { JSONArray() }
+                  arr.put(JSONObject().apply {
+                      put("lat", location.latitude)
+                      put("lon", location.longitude)
+                      put("acc", location.accuracy)
+                      put("ts", location.time)
+                  })
+                  prefs.edit().putString(key, arr.toString()).apply()
+              }
+
+              private fun stopTracking() {
+                  try { locationManager.removeUpdates(this) } catch (_: Exception) {}
+              }
+
+              override fun onDestroy() {
+                  stopTracking()
+                  super.onDestroy()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+              override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+              override fun onProviderEnabled(provider: String) {}
+              override fun onProviderDisabled(provider: String) {}
+          }
+          EOF
+
+          cat > native/app/src/main/java/com/gastosviaje/app/MainActivity.kt <<'EOF'
+          package com.gastosviaje.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.webkit.GeolocationPermissions
+          import android.webkit.PermissionRequest
+          import android.webkit.WebChromeClient
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.util.Locale
+
+          class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
+              private lateinit var webView: WebView
+              private var recognizer: SpeechRecognizer? = null
+              private var listenMode: String = "manual"
+              private var tts: TextToSpeech? = null
+              private var assistantLanguageTag: String = "es-419"
+
+              private val permissionLauncher = registerForActivityResult(
+                  ActivityResultContracts.RequestMultiplePermissions()
+              ) { }
+
+              private val routeReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      if (intent?.action != LocationTrackingService.ACTION_POINT) return
+                      val lat = intent.getDoubleExtra(LocationTrackingService.EXTRA_LAT, Double.NaN)
+                      val lon = intent.getDoubleExtra(LocationTrackingService.EXTRA_LON, Double.NaN)
+                      val acc = intent.getDoubleExtra(LocationTrackingService.EXTRA_ACC, Double.NaN)
+                      val ts = intent.getLongExtra(LocationTrackingService.EXTRA_TS, 0L)
+                      if (lat.isFinite() && lon.isFinite()) {
+                          js("window.onNativeRoutePoint && window.onNativeRoutePoint($lat,$lon,$acc,$ts)")
+                      }
+                  }
+              }
+
+              @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  webView = WebView(this)
+                  setContentView(webView)
+                  tts = TextToSpeech(this, this)
+                  requestPermissionsIfNeeded()
+
+                  webView.settings.javaScriptEnabled = true
+                  webView.settings.domStorageEnabled = true
+                  webView.settings.databaseEnabled = true
+                  webView.settings.allowFileAccess = true
+                  webView.settings.allowContentAccess = true
+                  webView.settings.mediaPlaybackRequiresUserGesture = false
+                  webView.webViewClient = WebViewClient()
+                  webView.webChromeClient = object : WebChromeClient() {
+                      override fun onPermissionRequest(request: PermissionRequest) {
+                          runOnUiThread { request.grant(request.resources) }
+                      }
+                      override fun onGeolocationPermissionsShowPrompt(origin: String?, callback: GeolocationPermissions.Callback?) {
+                          callback?.invoke(origin, true, false)
+                      }
+                  }
+                  webView.addJavascriptInterface(NativeBridge(), "AndroidNative")
+                  webView.loadUrl("file:///android_asset/www/index.html")
+
+                  ContextCompat.registerReceiver(
+                      this,
+                      routeReceiver,
+                      IntentFilter(LocationTrackingService.ACTION_POINT),
+                      ContextCompat.RECEIVER_NOT_EXPORTED
+                  )
+              }
+
+              private fun requestPermissionsIfNeeded() {
+                  val wanted = mutableListOf(
+                      Manifest.permission.RECORD_AUDIO,
+                      Manifest.permission.ACCESS_FINE_LOCATION,
+                      Manifest.permission.ACCESS_COARSE_LOCATION,
+                      Manifest.permission.CAMERA
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) wanted += Manifest.permission.POST_NOTIFICATIONS
+                  val needed = wanted.filter {
+                      ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+                  }
+                  if (needed.isNotEmpty()) permissionLauncher.launch(needed.toTypedArray())
+              }
+
+              inner class NativeBridge {
+                  @android.webkit.JavascriptInterface
+                  fun startListening(mode: String) { runOnUiThread { beginListening(mode) } }
+
+                  @android.webkit.JavascriptInterface
+                  fun stopListening() { runOnUiThread { recognizer?.stopListening() } }
+
+                  @android.webkit.JavascriptInterface
+                  fun setLanguage(tag: String) {
+                      assistantLanguageTag = tag.ifBlank { "es-419" }
+                  }
+
+                  @android.webkit.JavascriptInterface
+                  fun speak(text: String, voiceName: String) { runOnUiThread { speakText(text, voiceName) } }
+
+                  @android.webkit.JavascriptInterface
+                  fun getVoices(): String {
+                      val arr = JSONArray()
+                      val engine = tts ?: return arr.toString()
+                      engine.voices?.sortedBy { it.name }?.forEach { v ->
+                          arr.put(JSONObject().apply {
+                              put("name", v.name)
+                              put("lang", v.locale?.toLanguageTag() ?: "")
+                          })
+                      }
+                      return arr.toString()
+                  }
+
+                  @android.webkit.JavascriptInterface
+                  fun startRoute(day: String) {
+                      if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                          runOnUiThread { requestPermissionsIfNeeded() }
+                          return
+                      }
+                      val i = Intent(this@MainActivity, LocationTrackingService::class.java).apply {
+                          action = LocationTrackingService.ACTION_START
+                          putExtra(LocationTrackingService.EXTRA_DAY, day)
+                      }
+                      ContextCompat.startForegroundService(this@MainActivity, i)
+                  }
+
+                  @android.webkit.JavascriptInterface
+                  fun stopRoute() {
+                      val i = Intent(this@MainActivity, LocationTrackingService::class.java).apply {
+                          action = LocationTrackingService.ACTION_STOP
+                      }
+                      startService(i)
+                  }
+
+                  @android.webkit.JavascriptInterface
+                  fun getRoute(day: String): String {
+                      val prefs = getSharedPreferences("native_routes", Context.MODE_PRIVATE)
+                      return prefs.getString("route_$day", "[]") ?: "[]"
+                  }
+              }
+
+              private fun beginListening(mode: String) {
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      js("window.onNativeSpeechError && window.onNativeSpeechError('El reconocimiento de voz no está disponible.', ${JSONObject.quote(mode)})")
+                      return
+                  }
+                  listenMode = mode
+                  recognizer?.destroy()
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+                  recognizer?.setRecognitionListener(object : RecognitionListener {
+                      override fun onResults(results: Bundle?) {
+                          val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
+                          js("window.onNativeSpeechResult && window.onNativeSpeechResult(${JSONObject.quote(text)}, ${JSONObject.quote(listenMode)})")
+                      }
+                      override fun onError(error: Int) {
+                          js("window.onNativeSpeechError && window.onNativeSpeechError('', ${JSONObject.quote(listenMode)})")
+                      }
+                      override fun onReadyForSpeech(params: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(rmsdB: Float) {}
+                      override fun onBufferReceived(buffer: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(partialResults: Bundle?) {}
+                      override fun onEvent(eventType: Int, params: Bundle?) {}
+                  })
+                  val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, assistantLanguageTag)
+                      putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+                      putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                  }
+                  recognizer?.startListening(intent)
+              }
+
+              private fun speakText(text: String, voiceName: String) {
+                  val engine = tts ?: return
+                  engine.voices?.firstOrNull { it.name == voiceName }?.let { engine.voice = it }
+                  engine.language = Locale.forLanguageTag(assistantLanguageTag)
+                  engine.speak(text, TextToSpeech.QUEUE_FLUSH, null, "assistant")
+              }
+
+              override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) {
+                      tts?.language = Locale.forLanguageTag(assistantLanguageTag)
+                      tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                          override fun onStart(utteranceId: String?) {}
+                          override fun onDone(utteranceId: String?) { runOnUiThread { js("window.onNativeSpeechDone && window.onNativeSpeechDone()") } }
+                          override fun onError(utteranceId: String?) { runOnUiThread { js("window.onNativeSpeechDone && window.onNativeSpeechDone()") } }
+                      })
+                  }
+              }
+
+              private fun js(code: String) { runOnUiThread { webView.evaluateJavascript(code, null) } }
+
+              override fun onDestroy() {
+                  try { unregisterReceiver(routeReceiver) } catch (_: Exception) {}
+                  recognizer?.destroy()
+                  tts?.shutdown()
+                  webView.destroy()
+                  super.onDestroy()
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+              }
+          }
+          EOF
+
+          for f in index.html datos-iniciales.json manifest.webmanifest icon-192.png icon-512.png sw.js; do
+            if [ -f "$f" ]; then cp "$f" native/app/src/main/assets/www/; fi
+          done
+
+          test -f native/app/src/main/assets/www/index.html
+
+      - name: Compilar APK
+        working-directory: native
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publicar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gastos-de-Viaje-APK
+          path: native/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
