@@ -1,0 +1,1351 @@
+name: APK B46 JARVIS REPARADO
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-b46-jarvis-fix.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Instalar SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Crear proyecto Android
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf android-build
+          mkdir -p android-build/app/src/main/java/com/gastosviaje/app
+          mkdir -p android-build/app/src/main/res/values
+          mkdir -p android-build/app/src/main/assets/www
+
+          cat > android-build/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "GastosViaje"
+          include ':app'
+          EOF
+
+          cat > android-build/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > android-build/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.gastosviaje.app'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.gastosviaje.b46'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 152
+                  versionName 'B46'
+              }
+          }
+          EOF
+
+          cat > android-build/app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowLightStatusBar">true</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > android-build/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.CAMERA" />
+          
+              <application
+                  android:allowBackup="true"
+                  android:label="Gastos Viaje B46"
+                  android:theme="@style/AppTheme"
+                  android:usesCleartextTraffic="true">
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+          
+                  <service
+                      android:name=".LocationTrackingService"
+                      android:exported="false"
+                      android:foregroundServiceType="location" />
+                  <service
+                      android:name=".VoiceAssistantService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > android-build/app/src/main/java/com/gastosviaje/app/LocationTrackingService.java <<'EOF'
+          package com.gastosviaje.app;
+
+          import android.Manifest;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.location.Location;
+          import android.location.LocationListener;
+          import android.location.LocationManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.IBinder;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class LocationTrackingService extends Service implements LocationListener {
+              public static final String ACTION_START = "com.gastosviaje.app.START_ROUTE";
+              public static final String ACTION_STOP = "com.gastosviaje.app.STOP_ROUTE";
+              public static final String EXTRA_DAY = "day";
+              private static final String CHANNEL_ID = "route_tracking";
+              private LocationManager locationManager;
+              private String day = "hoy";
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  locationManager = (LocationManager) getSystemService(LOCATION_SERVICE);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      NotificationChannel channel = new NotificationChannel(
+                          CHANNEL_ID, "Recorrido GPS", NotificationManager.IMPORTANCE_LOW);
+                      getSystemService(NotificationManager.class).createNotificationChannel(channel);
+                  }
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+                      stopTracking();
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+
+                  if (intent != null && intent.getStringExtra(EXTRA_DAY) != null) {
+                      day = intent.getStringExtra(EXTRA_DAY);
+                  }
+
+                  Intent open = new Intent(this, MainActivity.class);
+                  PendingIntent pi = PendingIntent.getActivity(
+                      this, 0, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+                  Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                      ? new Notification.Builder(this, CHANNEL_ID)
+                      : new Notification.Builder(this);
+
+                  Notification notification = builder
+                      .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+                      .setContentTitle("Gastos de Viaje")
+                      .setContentText("Grabando recorrido GPS")
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build();
+
+                  startForeground(1206, notification);
+                  startTracking();
+                  return START_STICKY;
+              }
+
+              private void startTracking() {
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED &&
+                      checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      stopSelf();
+                      return;
+                  }
+                  try {
+                      locationManager.requestLocationUpdates(LocationManager.GPS_PROVIDER, 4000L, 5f, this);
+                  } catch (Exception ignored) {}
+                  try {
+                      locationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 7000L, 10f, this);
+                  } catch (Exception ignored) {}
+              }
+
+              private void stopTracking() {
+                  try { locationManager.removeUpdates(this); } catch (Exception ignored) {}
+              }
+
+              @Override
+              public void onLocationChanged(Location location) {
+                  try {
+                      String key = "route_" + day;
+                      String old = getSharedPreferences("native_routes", MODE_PRIVATE).getString(key, "[]");
+                      JSONArray arr = new JSONArray(old);
+                      JSONObject p = new JSONObject();
+                      p.put("lat", location.getLatitude());
+                      p.put("lon", location.getLongitude());
+                      p.put("acc", location.getAccuracy());
+                      p.put("ts", location.getTime());
+                      arr.put(p);
+                      getSharedPreferences("native_routes", MODE_PRIVATE)
+                          .edit().putString(key, arr.toString()).apply();
+                  } catch (Exception ignored) {}
+              }
+
+              @Override public void onStatusChanged(String provider, int status, Bundle extras) {}
+              @Override public void onProviderEnabled(String provider) {}
+              @Override public void onProviderDisabled(String provider) {}
+              @Override public IBinder onBind(Intent intent) { return null; }
+              @Override public void onDestroy() { stopTracking(); super.onDestroy(); }
+          }
+          EOF
+
+          cat > android-build/app/src/main/java/com/gastosviaje/app/MainActivity.java <<'EOF'
+          package com.gastosviaje.app;
+          
+          import android.Manifest;
+          import android.annotation.SuppressLint;
+          import android.app.Activity;
+          import android.content.ContentValues;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.IntentFilter;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.provider.Settings;
+          import android.speech.RecognizerIntent;
+          import android.speech.tts.TextToSpeech;
+          import android.webkit.GeolocationPermissions;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.PermissionRequest;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          
+          import java.util.ArrayList;
+          import java.util.Locale;
+          import java.io.OutputStream;
+          import java.nio.charset.StandardCharsets;
+          
+          public class MainActivity extends Activity {
+              private static final int REQ_PERMS = 10;
+              private static final int REQ_FILE = 11;
+              private static final int REQ_SPEECH = 12;
+          
+              private WebView webView;
+              private ValueCallback<Uri[]> fileCallback;
+              private TextToSpeech tts;
+              private String speechMode = "manual";
+              private final BroadcastReceiver assistantReceiver = new BroadcastReceiver() {
+                  @Override public void onReceive(Context context, Intent intent) {
+                      String text = intent.getStringExtra(VoiceAssistantService.EXTRA_TEXT);
+                      if (text == null) return;
+                      if (VoiceAssistantService.ACTION_STATUS.equals(intent.getAction())) {
+                          js("window.onNativeAssistantStatus && window.onNativeAssistantStatus(" + JSONObject.quote(text) + ")");
+                      } else {
+                          js("window.onNativeAssistantCommand && window.onNativeAssistantCommand(" + JSONObject.quote(text) + ")");
+                      }
+                  }
+              };
+          
+              @SuppressLint({"SetJavaScriptEnabled", "JavascriptInterface"})
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+          
+                  requestPermissions(new String[]{
+                      Manifest.permission.RECORD_AUDIO,
+                      Manifest.permission.ACCESS_FINE_LOCATION,
+                      Manifest.permission.ACCESS_COARSE_LOCATION,
+                      Manifest.permission.CAMERA,
+                      Manifest.permission.READ_CONTACTS,
+                      Manifest.permission.CALL_PHONE,
+                      Manifest.permission.BLUETOOTH_CONNECT
+                  }, REQ_PERMS);
+          
+                  tts = new TextToSpeech(this, status -> {
+                      if (status == TextToSpeech.SUCCESS) {
+                          tts.setLanguage(Locale.forLanguageTag("es-419"));
+                      }
+                  });
+          
+                  webView = new WebView(this);
+                  setContentView(webView);
+                  webView.getSettings().setJavaScriptEnabled(true);
+                  webView.getSettings().setDomStorageEnabled(true);
+                  webView.getSettings().setDatabaseEnabled(true);
+                  webView.getSettings().setAllowFileAccess(true);
+                  webView.getSettings().setAllowContentAccess(true);
+                  webView.getSettings().setMediaPlaybackRequiresUserGesture(false);
+                  webView.setWebViewClient(new WebViewClient());
+          
+                  webView.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public void onPermissionRequest(PermissionRequest request) {
+                          runOnUiThread(() -> request.grant(request.getResources()));
+                      }
+          
+                      @Override
+                      public void onGeolocationPermissionsShowPrompt(
+                          String origin, GeolocationPermissions.Callback callback) {
+                          callback.invoke(origin, true, false);
+                      }
+          
+                      @Override
+                      public boolean onShowFileChooser(
+                          WebView webView,
+                          ValueCallback<Uri[]> filePathCallback,
+                          FileChooserParams fileChooserParams) {
+                          if (fileCallback != null) fileCallback.onReceiveValue(null);
+                          fileCallback = filePathCallback;
+                          Intent i = fileChooserParams.createIntent();
+                          try {
+                              startActivityForResult(i, REQ_FILE);
+                              return true;
+                          } catch (Exception e) {
+                              fileCallback = null;
+                              return false;
+                          }
+                      }
+                  });
+          
+                  webView.addJavascriptInterface(new NativeBridge(), "AndroidNative");
+                  webView.loadUrl("file:///android_asset/www/index.html");
+                  IntentFilter af = new IntentFilter(VoiceAssistantService.ACTION_COMMAND);
+                  af.addAction(VoiceAssistantService.ACTION_STATUS);
+                  if (android.os.Build.VERSION.SDK_INT >= 33) registerReceiver(assistantReceiver, af, Context.RECEIVER_NOT_EXPORTED);
+                  else registerReceiver(assistantReceiver, af);
+              }
+          
+              public class NativeBridge {
+                  @JavascriptInterface
+                  public void setAssistantActive(boolean active, String name, String reply, String voice, String route) {
+                      Intent i = new Intent(MainActivity.this, VoiceAssistantService.class);
+                      i.setAction(active ? VoiceAssistantService.ACTION_START : VoiceAssistantService.ACTION_STOP);
+                      i.putExtra(VoiceAssistantService.EXTRA_NAME, name);
+                      i.putExtra(VoiceAssistantService.EXTRA_REPLY, reply);
+                      i.putExtra(VoiceAssistantService.EXTRA_VOICE, voice);
+                      i.putExtra(VoiceAssistantService.EXTRA_ROUTE, route);
+                      if (active && android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+                      else startService(i);
+                  }
+                  @JavascriptInterface
+                  public void saveTextFile(String fileName, String content) {
+                      new Thread(() -> {
+                          try {
+                              ContentValues values = new ContentValues();
+                              values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+                              values.put(MediaStore.Downloads.MIME_TYPE, "application/json");
+                              values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                              Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                              if (uri == null) throw new Exception("No se pudo crear el archivo");
+                              try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                                  if (out == null) throw new Exception("No se pudo abrir Descargas");
+                                  out.write(content.getBytes(StandardCharsets.UTF_8));
+                              }
+                              js("window.onNativeBackupSaved && window.onNativeBackupSaved(true," + JSONObject.quote(fileName) + ")");
+                          } catch (Exception e) {
+                              js("window.onNativeBackupSaved && window.onNativeBackupSaved(false," + JSONObject.quote(e.getMessage()) + ")");
+                          }
+                      }).start();
+                  }
+          
+                  @JavascriptInterface
+                  public void speak(String text, String voiceName) {
+                      runOnUiThread(() -> {
+                          if (tts != null) {
+                              if (voiceName != null && !voiceName.isEmpty() && tts.getVoices() != null) {
+                                  for (android.speech.tts.Voice v : tts.getVoices()) {
+                                      if (voiceName.equals(v.getName())) { tts.setVoice(v); break; }
+                                  }
+                              }
+                              tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "assistant");
+                          }
+                      });
+                  }
+          
+                  @JavascriptInterface
+                  public String getVoices() {
+                      JSONArray arr = new JSONArray();
+                      try {
+                          if (tts != null && tts.getVoices() != null) {
+                              tts.getVoices().forEach(v -> {
+                                  JSONObject o = new JSONObject();
+                                  try {
+                                      o.put("name", v.getName());
+                                      o.put("lang", v.getLocale().toLanguageTag());
+                                      arr.put(o);
+                                  } catch (Exception ignored) {}
+                              });
+                          }
+                      } catch (Exception ignored) {}
+                      return arr.toString();
+                  }
+          
+                  @JavascriptInterface
+                  public void startListening(String mode) {
+                      speechMode = mode == null ? "manual" : mode;
+                      runOnUiThread(() -> {
+                          Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                          i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                          i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-419");
+                          try {
+                              startActivityForResult(i, REQ_SPEECH);
+                          } catch (Exception e) {
+                              js("window.onNativeSpeechError && window.onNativeSpeechError('No disponible','" + speechMode + "')");
+                          }
+                      });
+                  }
+          
+                  @JavascriptInterface
+                  public void startRoute(String day) {
+                      Intent i = new Intent(MainActivity.this, LocationTrackingService.class);
+                      i.setAction(LocationTrackingService.ACTION_START);
+                      i.putExtra(LocationTrackingService.EXTRA_DAY, day == null ? "hoy" : day);
+                      if (android.os.Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+                      else startService(i);
+                  }
+          
+                  @JavascriptInterface
+                  public void stopRoute() {
+                      Intent i = new Intent(MainActivity.this, LocationTrackingService.class);
+                      i.setAction(LocationTrackingService.ACTION_STOP);
+                      startService(i);
+                  }
+          
+                  @JavascriptInterface
+                  public String getRoute(String day) {
+                      return getSharedPreferences("native_routes", MODE_PRIVATE)
+                          .getString("route_" + day, "[]");
+                  }
+              }
+          
+              private void js(String code) {
+                  runOnUiThread(() -> webView.evaluateJavascript(code, null));
+              }
+          
+              @Override
+              protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+                  super.onActivityResult(requestCode, resultCode, data);
+          
+                  if (requestCode == REQ_FILE) {
+                      if (fileCallback != null) {
+                          Uri[] result = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
+                          fileCallback.onReceiveValue(result);
+                          fileCallback = null;
+                      }
+                      return;
+                  }
+          
+                  if (requestCode == REQ_SPEECH) {
+                      String text = "";
+                      if (resultCode == RESULT_OK && data != null) {
+                          ArrayList<String> results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+                          if (results != null && !results.isEmpty()) text = results.get(0);
+                      }
+                      String safe = JSONObject.quote(text);
+                      String mode = JSONObject.quote(speechMode);
+                      js("window.onNativeSpeechResult && window.onNativeSpeechResult(" + safe + "," + mode + ")");
+                  }
+              }
+          
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) webView.goBack();
+                  else super.onBackPressed();
+              }
+          
+              @Override
+              protected void onDestroy() {
+                  try { unregisterReceiver(assistantReceiver); } catch (Exception ignored) {}
+                  if (tts != null) {
+                      tts.stop();
+                      tts.shutdown();
+                  }
+                  if (webView != null) webView.destroy();
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+          cat > android-build/app/src/main/java/com/gastosviaje/app/VoiceAssistantService.java <<'EOF'
+          package com.gastosviaje.app;
+          
+          import android.Manifest;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.bluetooth.BluetoothProfile;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.database.Cursor;
+          import android.media.AudioDeviceInfo;
+          import android.media.AudioManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.provider.ContactsContract;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import android.speech.tts.TextToSpeech;
+          import android.speech.tts.UtteranceProgressListener;
+          import android.view.KeyEvent;
+          
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+          
+          import java.text.Normalizer;
+          import java.util.ArrayList;
+          import java.util.Locale;
+          
+          public class VoiceAssistantService extends Service implements RecognitionListener {
+              public static final String ACTION_START = "com.gastosviaje.app.ASSISTANT_START";
+              public static final String ACTION_STOP = "com.gastosviaje.app.ASSISTANT_STOP";
+              public static final String ACTION_COMMAND = "com.gastosviaje.app.ASSISTANT_COMMAND";
+              public static final String ACTION_STATUS = "com.gastosviaje.app.ASSISTANT_STATUS";
+              public static final String EXTRA_TEXT = "text";
+              public static final String EXTRA_NAME = "name";
+              public static final String EXTRA_REPLY = "reply";
+              public static final String EXTRA_VOICE = "voice";
+              public static final String EXTRA_ROUTE = "route";
+              private static final String CHANNEL_ID = "voice_assistant";
+              private static final int NOTIFICATION_ID = 451;
+          
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private SpeechRecognizer recognizer;
+              private Intent recognizerIntent;
+              private TextToSpeech tts;
+              private AudioManager audioManager;
+              private boolean running;
+              private boolean listening;
+              private boolean speaking;
+              private boolean awaitingCommand;
+              private String wakeName = "jarvis";
+              private String activationReply = "Sí, señor";
+              private String preferredVoice = "";
+              private String routeJson = "";
+              private String pendingCallName = "";
+              private String pendingCallNumber = "";
+              private String lastHandledPhrase = "";
+              private long lastHandledAt = 0L;
+          
+              @Override public void onCreate() {
+                  super.onCreate();
+                  audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+                  createChannel();
+                  tts = new TextToSpeech(this, status -> {
+                      if (status == TextToSpeech.SUCCESS) {
+                          tts.setLanguage(Locale.forLanguageTag("es-419"));
+                          tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                              @Override public void onStart(String id) { speaking = true; }
+                              @Override public void onDone(String id) { speaking = false; handler.postDelayed(thisService()::listen, 350); }
+                              @Override public void onError(String id) { speaking = false; handler.postDelayed(thisService()::listen, 350); }
+                          });
+                      }
+                  });
+              }
+          
+              private VoiceAssistantService thisService() { return this; }
+          
+              @Override public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+                      stopAssistant();
+                      return START_NOT_STICKY;
+                  }
+                  if (intent != null) {
+                      String v;
+                      v = intent.getStringExtra(EXTRA_NAME); if (v != null && !v.trim().isEmpty()) wakeName = normalize(v);
+                      v = intent.getStringExtra(EXTRA_REPLY); if (v != null && !v.trim().isEmpty()) activationReply = v.trim();
+                      v = intent.getStringExtra(EXTRA_VOICE); if (v != null) preferredVoice = v;
+                      v = intent.getStringExtra(EXTRA_ROUTE); if (v != null) routeJson = v;
+                  }
+                  running = true;
+                  startForeground(NOTIFICATION_ID, notification("Escuchando “" + wakeName + "” por el intercomunicador"));
+                  selectBluetoothMicrophone();
+                  initRecognizer();
+                  sendStatus("Micrófono activo. Decí “" + wakeName + "”.");
+                  listen();
+                  return START_STICKY;
+              }
+          
+              private void createChannel() {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel channel = new NotificationChannel(CHANNEL_ID, "Asistente de viaje", NotificationManager.IMPORTANCE_LOW);
+                      channel.setDescription("Mantiene activo el modo manos libres");
+                      getSystemService(NotificationManager.class).createNotificationChannel(channel);
+                  }
+              }
+          
+              private Notification notification(String text) {
+                  Intent open = new Intent(this, MainActivity.class);
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
+                  return b.setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentTitle("Gastos Viaje B45 · Jarvis")
+                      .setContentText(text).setContentIntent(pi).setOngoing(true).build();
+              }
+          
+              private void selectBluetoothMicrophone() {
+                  try {
+                      if (Build.VERSION.SDK_INT >= 31 && checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) {
+                          for (AudioDeviceInfo d : audioManager.getAvailableCommunicationDevices()) {
+                              if (d.getType() == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+                                  audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                                  audioManager.setCommunicationDevice(d);
+                                  return;
+                              }
+                          }
+                      }
+                      audioManager.setMode(AudioManager.MODE_NORMAL);
+                  } catch (Exception ignored) {}
+              }
+          
+              private void initRecognizer() {
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      speak("El reconocimiento de voz no está disponible en este teléfono.");
+                      return;
+                  }
+                  if (recognizer != null) recognizer.destroy();
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this);
+                  recognizer.setRecognitionListener(this);
+                  recognizerIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                  recognizerIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                  recognizerIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-419");
+                  recognizerIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+                  recognizerIntent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+              }
+          
+              private void listen() {
+                  if (!running || speaking || listening || recognizer == null) return;
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return;
+                  try {
+                      listening = true;
+                      recognizer.startListening(recognizerIntent);
+                  } catch (Exception e) {
+                      listening = false;
+                      handler.postDelayed(this::listen, 900);
+                  }
+              }
+          
+              private void sendStatus(String status) {
+                  sendBroadcast(new Intent(ACTION_STATUS).setPackage(getPackageName()).putExtra(EXTRA_TEXT, status));
+              }
+          
+              private void handleHeard(String raw) {
+                  String heard = normalize(raw);
+                  if (heard.isEmpty()) return;
+                  long now = android.os.SystemClock.elapsedRealtime();
+                  if (heard.equals(lastHandledPhrase) && now - lastHandledAt < 3500L) return;
+                  if (!pendingCallNumber.isEmpty()) {
+                      if (heard.matches(".*\\b(si|confirmar|llamar|llama)\\b.*")) {
+                          placeCall();
+                      } else if (heard.matches(".*\\b(no|cancelar|cancela)\\b.*")) {
+                          pendingCallName = ""; pendingCallNumber = "";
+                          speak("Llamada cancelada.");
+                      }
+                      return;
+                  }
+                  String command = "";
+                  int wakeAt = heard.indexOf(wakeName);
+                  if (wakeAt >= 0) {
+                      lastHandledPhrase = heard;
+                      lastHandledAt = now;
+                      command = heard.substring(wakeAt + wakeName.length()).trim();
+                      if (command.isEmpty()) {
+                          awaitingCommand = true;
+                          speak(activationReply);
+                          return;
+                      }
+                  } else if (awaitingCommand) {
+                      command = heard;
+                      awaitingCommand = false;
+                  } else {
+                      return;
+                  }
+                  execute(command);
+              }
+          
+              private void execute(String command) {
+                  if (command.contains("spotify") || command.matches(".*\\b(reproducir|musica|cancion|pausa|siguiente|anterior)\\b.*")) {
+                      handleSpotify(command);
+                      return;
+                  }
+                  if (command.startsWith("llamar ") || command.startsWith("llama ")) {
+                      String name = command.replaceFirst("^llam(ar|a)\\s+(a\\s+)?", "").trim();
+                      findContact(name);
+                      return;
+                  }
+                  if (command.contains("ruta") || command.contains("hoja de ruta") || command.contains("terma") ||
+                      command.contains("combustible cerca") || command.contains("historia") || command.contains("pueblo")) {
+                      answerRoute(command);
+                      return;
+                  }
+                  Intent i = new Intent(ACTION_COMMAND).setPackage(getPackageName()).putExtra(EXTRA_TEXT, command);
+                  sendBroadcast(i);
+              }
+          
+              private void handleSpotify(String command) {
+                  if (command.contains("pausa")) { mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE); speak("Spotify en pausa."); return; }
+                  if (command.contains("siguiente")) { mediaKey(KeyEvent.KEYCODE_MEDIA_NEXT); speak("Siguiente."); return; }
+                  if (command.contains("anterior")) { mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS); speak("Anterior."); return; }
+                  String query = command.replace("abrir spotify", "").replace("spotify", "")
+                      .replaceFirst("^(reproducir|buscar|pone|poneme|musica|cancion)\\s*", "").trim();
+                  Intent launch;
+                  if (query.isEmpty()) launch = getPackageManager().getLaunchIntentForPackage("com.spotify.music");
+                  else launch = new Intent(Intent.ACTION_VIEW, Uri.parse("spotify:search:" + Uri.encode(query)));
+                  if (launch == null) launch = new Intent(Intent.ACTION_VIEW, Uri.parse("https://open.spotify.com/search/" + Uri.encode(query)));
+                  launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  try { startActivity(launch); speak(query.isEmpty() ? "Abriendo Spotify." : "Buscando " + query + " en Spotify."); }
+                  catch (Exception e) { speak("No pude abrir Spotify."); }
+              }
+          
+              private void mediaKey(int code) {
+                  long now = android.os.SystemClock.uptimeMillis();
+                  audioManager.dispatchMediaKeyEvent(new KeyEvent(now, now, KeyEvent.ACTION_DOWN, code, 0));
+                  audioManager.dispatchMediaKeyEvent(new KeyEvent(now, now, KeyEvent.ACTION_UP, code, 0));
+              }
+          
+              private void findContact(String wanted) {
+                  if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
+                      speak("Necesito permiso para leer tus contactos.");
+                      return;
+                  }
+                  Cursor c = getContentResolver().query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      new String[]{ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME, ContactsContract.CommonDataKinds.Phone.NUMBER},
+                      ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " LIKE ?",
+                      new String[]{"%" + wanted + "%"}, null);
+                  if (c != null) {
+                      try {
+                          if (c.moveToFirst()) {
+                              pendingCallName = c.getString(0);
+                              pendingCallNumber = c.getString(1);
+                              speak("Encontré a " + pendingCallName + ". ¿Confirmás que lo llame?");
+                              return;
+                          }
+                      } finally { c.close(); }
+                  }
+                  speak("No encontré a " + wanted + " en tus contactos.");
+              }
+          
+              private void placeCall() {
+                  if (checkSelfPermission(Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) {
+                      speak("Necesito permiso para realizar llamadas.");
+                      return;
+                  }
+                  String name = pendingCallName;
+                  Intent i = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(pendingCallNumber)));
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  pendingCallName = ""; pendingCallNumber = "";
+                  try { startActivity(i); speak("Llamando a " + name + "."); }
+                  catch (Exception e) { speak("No pude iniciar la llamada."); }
+              }
+          
+              private void answerRoute(String command) {
+                  try {
+                      if (routeJson == null || routeJson.trim().isEmpty() || routeJson.equals("null")) {
+                          speak("Todavía no hay una hoja de ruta descargada.");
+                          return;
+                      }
+                      JSONObject r = new JSONObject(routeJson);
+                      String title = r.optString("title", r.optString("name", "tu hoja de ruta"));
+                      JSONArray places = r.optJSONArray("places");
+                      StringBuilder answer = new StringBuilder("Tenés descargada ").append(title).append(".");
+                      if (places != null && places.length() > 0) {
+                          answer.append(" Próximos lugares: ");
+                          for (int n = 0; n < Math.min(3, places.length()); n++) {
+                              if (n > 0) answer.append(", ");
+                              Object p = places.opt(n);
+                              answer.append(p instanceof JSONObject ? ((JSONObject)p).optString("name", p.toString()) : String.valueOf(p));
+                          }
+                          answer.append(".");
+                      }
+                      speak(answer.toString());
+                  } catch (Exception e) {
+                      speak("La hoja de ruta está descargada, pero no pude leer esa consulta.");
+                  }
+              }
+          
+              private void speak(String text) {
+                  listening = false;
+                  try { if (recognizer != null) recognizer.cancel(); } catch (Exception ignored) {}
+                  if (tts == null) { handler.postDelayed(this::listen, 500); return; }
+                  if (!preferredVoice.isEmpty() && tts.getVoices() != null) {
+                      for (android.speech.tts.Voice v : tts.getVoices()) {
+                          if (preferredVoice.equals(v.getName())) { tts.setVoice(v); break; }
+                      }
+                  }
+                  speaking = true;
+                  Bundle params = new Bundle();
+                  tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, "jarvis-service");
+              }
+          
+              private static String normalize(String s) {
+                  String n = Normalizer.normalize(s == null ? "" : s, Normalizer.Form.NFD)
+                      .replaceAll("\\p{M}", "").toLowerCase(Locale.ROOT);
+                  return n.replaceAll("[^a-z0-9ñ ]", " ").replaceAll("\\s+", " ").trim();
+              }
+          
+              private void stopAssistant() {
+                  running = false; listening = false;
+                  try { if (recognizer != null) { recognizer.cancel(); recognizer.destroy(); recognizer = null; } } catch (Exception ignored) {}
+                  try {
+                      if (Build.VERSION.SDK_INT >= 31) audioManager.clearCommunicationDevice();
+                      else { audioManager.stopBluetoothSco(); audioManager.setBluetoothScoOn(false); }
+                      audioManager.setMode(AudioManager.MODE_NORMAL);
+                  } catch (Exception ignored) {}
+                  stopForeground(true);
+                  stopSelf();
+              }
+          
+              @Override public void onReadyForSpeech(Bundle params) { sendStatus("Escuchando. Decí “" + wakeName + "”."); }
+              @Override public void onBeginningOfSpeech() {}
+              @Override public void onRmsChanged(float rmsdB) {}
+              @Override public void onBufferReceived(byte[] buffer) {}
+              @Override public void onEndOfSpeech() { listening = false; }
+              @Override public void onError(int error) {
+                  listening = false;
+                  if (error != SpeechRecognizer.ERROR_NO_MATCH && error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                      sendStatus("Reactivando micrófono…");
+                  }
+                  if (running && !speaking) handler.postDelayed(this::listen, error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ? 1200 : 500);
+              }
+              @Override public void onResults(Bundle results) {
+                  listening = false;
+                  ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  if (list != null && !list.isEmpty()) handleHeard(list.get(0));
+                  if (running && !speaking) handler.postDelayed(this::listen, 250);
+              }
+              @Override public void onPartialResults(Bundle partialResults) {
+                  ArrayList<String> list = partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                  if (list == null || list.isEmpty()) return;
+                  String heard = normalize(list.get(0));
+                  int wakeAt = heard.indexOf(wakeName);
+                  String afterWake = wakeAt >= 0 ? heard.substring(wakeAt + wakeName.length()).trim() : "";
+                  if (wakeAt >= 0 && afterWake.isEmpty()) {
+                      listening = false;
+                      try { recognizer.cancel(); } catch (Exception ignored) {}
+                      handleHeard(heard);
+                  }
+              }
+              @Override public void onEvent(int eventType, Bundle params) {}
+              @Override public IBinder onBind(Intent intent) { return null; }
+              @Override public void onDestroy() {
+                  running = false;
+                  try { if (recognizer != null) recognizer.destroy(); } catch (Exception ignored) {}
+                  if (tts != null) { tts.stop(); tts.shutdown(); }
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+          cat > /tmp/b44.html.gz.b64 <<'B44EOF'
+          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
+          rmH4sTXoPAZSnw+VBMXg8H/zfwGvJIGm6SwCAA==
+          B44EOF
+          base64 -d /tmp/b44.html.gz.b64 | gzip -d > android-build/app/src/main/assets/www/index.html
+
+          for f in icon-192.png icon-512.png; do
+            if [ -f "$f" ]; then
+              cp "$f" android-build/app/src/main/assets/www/
+            fi
+          done
+
+          test -s android-build/app/src/main/assets/www/index.html
+
+      - name: Compilar APK
+        working-directory: android-build
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Publicar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gastos-moto-B46-JARVIS
+          path: android-build/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
